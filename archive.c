@@ -4,14 +4,60 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "cJSON.h"
 
-#define DB_FILE "/data/archive.db"
+#define DB_FILE "archive.db"
+/**
+ * Parse ISO8601 timestamp string to time_t
+ * Supports formats:
+ * - "2025-04-09T05:20:55+09:00"
+ * - "2025-04-09T05:20:55.548239+00:00"
+ * - "2025-04-09T05:20:55Z"
+ * - "2025-04-09T05:20:55"
+ */
+time_t parse_iso8601(const char *timestamp_str) {
+    struct tm tm = {0};
+    char buf[32];
+    int tz_hour = 0, tz_min = 0;
+    char sign = '+';
 
-// Initialize SQLite DB and create table if not exists
+    // Copy timestamp to buffer with null termination
+    strncpy(buf, timestamp_str, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    // Truncate at fractional seconds
+    char *dot = strchr(buf, '.');
+    if (dot) *dot = '\0';
+
+    // Find timezone indicator
+    char *tz = strchr(timestamp_str, '+');
+    if (!tz) tz = strchr(timestamp_str, '-');
+    if (!tz) tz = strchr(timestamp_str, 'Z');
+
+    // Parse timezone offset if present
+    if (tz && *tz != 'Z') {
+        sign = *tz;
+        sscanf(tz + 1, "%2d:%2d", &tz_hour, &tz_min);
+    }
+
+    // Convert to time structure
+    strptime(buf, "%Y-%m-%dT%H:%M:%S", &tm);
+    time_t t = mktime(&tm);
+
+    // Apply timezone adjustment
+    int offset = (tz_hour * 3600 + tz_min * 60);
+    if (sign == '+') {
+        t -= offset;
+    } else if (sign == '-') {
+        t += offset;
+    }
+
+    return t;
+}
+
 int init_db(sqlite3 **db) {
     if (sqlite3_open(DB_FILE, db) != SQLITE_OK) return REDISMODULE_ERR;
-
     const char *sql = "CREATE TABLE IF NOT EXISTS archive (key TEXT PRIMARY KEY, value TEXT);";
     char *errmsg = NULL;
     if (sqlite3_exec(*db, sql, NULL, NULL, &errmsg) != SQLITE_OK) {
@@ -22,12 +68,9 @@ int init_db(sqlite3 **db) {
     return REDISMODULE_OK;
 }
 
-// ARCHIVE.SAVE key
 int ArchiveSaveCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 2) return RedisModule_WrongArity(ctx);
-
     RedisModule_AutoMemory(ctx);
-
     RedisModuleKey *key = RedisModule_OpenKey(ctx, argv[1], REDISMODULE_READ);
     if (RedisModule_KeyType(key) != REDISMODULE_KEYTYPE_STRING)
         return RedisModule_ReplyWithError(ctx, "ERR key is not a string");
@@ -61,10 +104,8 @@ int ArchiveSaveCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
 
-// ARCHIVE.GET key
 int ArchiveGetCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 2) return RedisModule_WrongArity(ctx);
-
     RedisModule_AutoMemory(ctx);
 
     sqlite3 *db;
@@ -94,10 +135,8 @@ int ArchiveGetCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     return REDISMODULE_OK;
 }
 
-// ARCHIVE.SWEEP pattern timestamp_field max_timestamp
 int ArchiveSweepCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 4) return RedisModule_WrongArity(ctx);
-
     RedisModule_AutoMemory(ctx);
     long long max_ts;
     if (RedisModule_StringToLongLong(argv[3], &max_ts) != REDISMODULE_OK)
@@ -110,7 +149,6 @@ int ArchiveSweepCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     for (size_t i = 0; i < count; i++) {
         RedisModuleCallReply *key = RedisModule_CallReplyArrayElement(keys, i);
         RedisModuleString *key_str = RedisModule_CreateStringFromCallReply(key);
-
         RedisModuleKey *rk = RedisModule_OpenKey(ctx, key_str, REDISMODULE_READ);
         if (RedisModule_KeyType(rk) != REDISMODULE_KEYTYPE_STRING) continue;
 
@@ -121,12 +159,19 @@ int ArchiveSweepCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 
         const char *field = RedisModule_StringPtrLen(argv[2], NULL);
         cJSON *ts_node = cJSON_GetObjectItemCaseSensitive(json, field);
-        if (!cJSON_IsNumber(ts_node)) {
+        long long ts_value = -1;
+        if (cJSON_IsNumber(ts_node)) {
+            ts_value = (long long)ts_node->valuedouble;
+        } else if (cJSON_IsString(ts_node)) {
+            ts_value = parse_iso8601(ts_node->valuestring);
+        }
+
+        if (ts_value == -1) {
             cJSON_Delete(json);
             continue;
         }
 
-        if ((long long)ts_node->valuedouble <= max_ts) {
+        if (ts_value <= max_ts) {
             RedisModule_Call(ctx, "ARCHIVE.SAVE", "s", key_str);
             archived++;
         }
@@ -138,19 +183,14 @@ int ArchiveSweepCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     return REDISMODULE_OK;
 }
 
-// Module entry point
 int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (RedisModule_Init(ctx, "archive", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-
     if (RedisModule_CreateCommand(ctx, "archive.save", ArchiveSaveCommand, "write", 1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-
     if (RedisModule_CreateCommand(ctx, "archive.get", ArchiveGetCommand, "readonly", 1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-
     if (RedisModule_CreateCommand(ctx, "archive.sweep", ArchiveSweepCommand, "write", 1, 1, 1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-
     return REDISMODULE_OK;
 }

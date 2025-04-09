@@ -28,6 +28,9 @@ docker build -t redis-archive .
 
 # Run Redis with module
 docker run -it --rm -p 6379:6379 redis-archive
+
+# Run Redis with module (with persistent data volume)
+docker run -it --rm -p 6379:6379 -v $(PWD)/data:/data redis-archive
 ```
 
 ## 🧪 Example Usage
